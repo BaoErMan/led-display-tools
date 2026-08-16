@@ -274,6 +274,11 @@ def main():
     ap.add_argument("--set", type=float, metavar="PCT", help="set brightness percent (0-100), broadcast")
     ap.add_argument("--set-raw", type=int, metavar="N", help="set raw brightness (0-255), broadcast")
     ap.add_argument("--no-gains", action="store_true", help="don't re-send the default R/G/B gains on --set")
+    ap.add_argument("--card", metavar="PORT:IDX", default=None,
+                    help="read ONE card and stop (1-based port, as nova_cards.py "
+                         "--walk prints it, e.g. --card 2:6). Works on a wall whose "
+                         "controller answers past the end of a chain, where the "
+                         "full scan is refused")
     ap.add_argument("--raw", action="store_true", help="print raw frames")
     args = ap.parse_args()
 
@@ -303,6 +308,28 @@ def main():
             print(f"== set brightness -> {rawv} (0x{rawv:02x}, {raw_to_pct(rawv)}%) broadcast to all cards ==")
 
         print(f"== NovaStar brightness on {args.port} @ {baud} 8N1 ==")
+        if args.card:
+            # Read ONE named card and stop. On a controller that answers past the
+            # end of a chain the scan below is refused (its count would be noise),
+            # which left no way to read the cards that ARE real - take the index
+            # from a nova_cards.py --walk, whose port numbers are 1-based too.
+            try:
+                _p, _i = (int(x) for x in args.card.split(":"))
+            except ValueError:
+                sys.exit("--card wants PORT:IDX with a 1-based port, e.g. --card 2:6")
+            _p -= 1
+            _seq = Seq()
+            _blk = transact(ser, build_read(_seq.next(), 0x01, _p, _i, RX_BLOCK, 256),
+                            args.raw)
+            _geo = parse_geometry(_blk[0]["data"] if _blk else b"")
+            _raw = read_brightness(ser, _p, _i, _seq, args.raw)
+            _what = f"{_geo[0]}x{_geo[1]}" if _geo else "no geometry (not a card)"
+            if _raw is None:
+                print(f"  port {_p+1} card {_i}: {_what}, brightness read returned nothing")
+                return 1
+            print(f"  port {_p+1} card {_i}: {_what}, brightness "
+                  f"{_raw:3d}/255  ({raw_to_pct(_raw)}%)")
+            return 0
         # Same guard as led_report: a port answering at an impossible index means
         # the scan would count noise and walk every index. Cheap, and it stops
         # this tool hanging on such a wall.

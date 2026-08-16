@@ -76,36 +76,44 @@ def survey_port(ser, port, seq, max_idx=127, on_read=None):
         clamp value those cards are real, and stopping there reported a 7-card
         port as 1 card (observed on a live MCTRL600, port 1 idx 0).
 
-    Only a run of CLAMP_RUN consecutive clamp-valued blocks ends it, and the run
-    it ends is marked open_ended: its true length is not knowable from the link.
+    What ends it, once the clamp probe has shown this controller answers past the
+    end of a chain: CLAMP_RUN consecutive IDENTICAL blocks - whether or not they
+    equal the clamp value. Requiring them to equal the clamp was not enough: on a
+    live MCTRL600 port 1 returned an odd block for the clamp probe, so the real
+    tail (240x80 repeating) never matched it and the walk read all 128 indices.
+    Beyond a repeat that long the tail length is unknowable anyway, so reading on
+    buys nothing.
+
+    That stop applies ONLY when clamp_dig is set. A controller that properly ends
+    a chain gives an exact count, and must keep walking through any number of
+    identical cards to get it.
     """
     clamp = _block(ser, port, max_idx + CLAMP_PROBE, seq)
     clamp_dig = _digest(clamp) if parse_geometry(clamp) else None
 
-    runs, prev, clamp_run = [], None, 0
+    runs, prev, repeat = [], None, 0
     idx = 0
     while idx <= max_idx:
         data = _block(ser, port, idx, seq)
         geo = parse_geometry(data)
         dig = _digest(data) if geo else None
         if on_read:
-            on_read(port, idx, geo, dig, dig is not None and dig == clamp_dig)
+            on_read(port, idx, geo, dig, dig is not None and dig == clamp_dig,
+                    data)
         if not geo:
             return runs, False                      # unused port / real end of chain
         if dig == prev:
             runs[-1]["last"] = idx
+            repeat += 1
         else:
             runs.append({"first": idx, "last": idx, "geometry": list(geo),
-                         "digest": dig,
+                         "digest": dig, "hint": data[HEIGHT_HINT_OFF],
                          "params": [data[o] for o in PARAM_OFFSETS]})
             prev = dig
-        if clamp_dig and dig == clamp_dig:
-            clamp_run += 1
-            if clamp_run >= CLAMP_RUN:
-                runs[-1]["open_ended"] = True
-                return _drop_echo(runs, clamp_dig), True
-        else:
-            clamp_run = 0                           # a real block broke the run
+            repeat = 1
+        if clamp_dig and repeat >= CLAMP_RUN:
+            runs[-1]["open_ended"] = True
+            return _drop_echo(runs, clamp_dig), True
         idx += 1
     # Ran the whole range without an end: the controller answers everything.
     if runs:
@@ -129,14 +137,53 @@ def _drop_echo(runs, clamp_dig):
     return runs
 
 
-def check_consistency(ports):
+def parse_ack(spec):
+    """{(port0, idx)} from ["1:0", ...] - the cards a human has confirmed are
+    deliberate. Written the way the dashboard SHOWS them: 1-based port, 0-based
+    index, so "1:0" is the "port 1 index 0" in the warning being acknowledged.
+
+    Accepts a list or a comma-separated string; unparseable entries are ignored
+    rather than raised, because a typo in config must not stop a wall reporting.
+    """
+    if not spec:
+        return set()
+    if isinstance(spec, str):
+        spec = spec.split(",")
+    out = set()
+    for item in spec:
+        try:
+            port, idx = str(item).strip().split(":")
+            out.add((int(port) - 1, int(idx)))
+        except (ValueError, AttributeError):
+            continue
+    return out
+
+
+def check_consistency(ports, ack=()):
     """Flag blocks whose geometry disagrees with others sharing their driver
-    parameters. That mismatch is what a misconfigured card looks like."""
+    parameters. That mismatch is what a misconfigured card looks like.
+
+    Cards in `ack` are known-deliberate and produce no issue. A live wall carries
+    a 240x20 strip added to compensate for shipping damage: correct by design, but
+    it matches no other card and would otherwise warn on every survey forever,
+    which is how people learn to ignore warnings. It still appears in the geometry.
+    """
+    ack = ack if isinstance(ack, set) else parse_ack(ack)
     by_params = {}
     for p in ports:
         for r in p["runs"]:
             by_params.setdefault(tuple(r["params"]), []).append((p["port"], r))
-    issues = []
+    issues, acked = [], []
+
+    def report(pt, idx, msg, advice):
+        # An acknowledged card keeps the description but drops the call to action:
+        # telling someone to go check a card they have already confirmed is how a
+        # report trains people to skim past it.
+        if (pt, idx) in ack:
+            acked.append(f"port {pt+1} index {idx}: {msg}")
+        else:
+            issues.append(f"port {pt+1} index {idx}: {msg} - {advice}")
+
     for params, entries in by_params.items():
         geos = {tuple(r["geometry"]) for _pt, r in entries}
         if len(geos) > 1:
@@ -148,16 +195,45 @@ def check_consistency(ports):
             for pt, r in entries:
                 g = tuple(r["geometry"])
                 if g != majority:
-                    issues.append(
-                        f"port {pt+1} index {r['first']}: geometry {g[0]}x{g[1]} but its "
-                        f"driver parameters match the {majority[0]}x{majority[1]} cards "
-                        f"- likely a misconfigured card")
-    return issues
+                    report(pt, r["first"],
+                           f"geometry {g[0]}x{g[1]} but its driver parameters match "
+                           f"the {majority[0]}x{majority[1]} cards",
+                           "likely a misconfigured card")
+
+    # The ODD ONE OUT: a single card whose driver parameters match no other card
+    # on the wall. The check above can never see it - it only compares geometry
+    # WITHIN a parameter group, and a card like this is alone in its own group,
+    # so nothing is ever compared and the survey reported "all cards consistent".
+    # That is how a 240x20 block with params[2 8 0 32] sat unflagged on a live
+    # wall between 240x100s (params[10 16 255 255]) and 240x80s (params[8 8 ...]).
+    if len(by_params) > 1:
+        for _params, entries in by_params.items():
+            if len(entries) != 1:
+                continue
+            pt, r = entries[0]
+            if r["first"] != r["last"]:
+                continue      # a whole RUN of them is a panel type, not a stray
+            g = r["geometry"]
+            report(pt, r["first"],
+                   f"{g[0]}x{g[1]}, driver parameters {r['params']} match no other "
+                   f"card on this wall",
+                   "check this card in NovaLCT (a blank or wrongly configured slot "
+                   "looks like this)")
+    return issues, acked
 
 
-def survey(ser, ports=4, max_idx=127, seq=None, on_read=None):
-    """Full survey. Returns a dict safe to serialise and report."""
+def survey(ser, ports=4, max_idx=127, seq=None, on_read=None, warmup=1, ack=()):
+    """Full survey. Returns a dict safe to serialise and report.
+
+    `warmup` throwaway reads run first because the FIRST transaction of a session
+    is not trustworthy: on a live MCTRL600 the very first read (port 1's clamp
+    probe) returned a 240x20 block that port 2's identical probe never produced,
+    and the next read repeated it. Discarding a read costs nothing and keeps that
+    artifact out of the clamp value, which every later decision depends on.
+    """
     seq = seq or Seq()
+    for _ in range(max(0, warmup)):
+        _block(ser, 0, 0, seq)
     out, any_clamped = [], False
     for p in range(ports):
         runs, clamped = survey_port(ser, p, seq, max_idx, on_read)
@@ -173,8 +249,9 @@ def survey(ser, ports=4, max_idx=127, seq=None, on_read=None):
                 "is not derivable; geometry per port is reliable")
     else:
         count = sum(r["last"] + 1 for p in live for r in p["runs"][-1:])
+    issues, acked = check_consistency(live, ack)
     return {"ports": out, "count": count, "count_note": note,
-            "issues": check_consistency(live)}
+            "issues": issues, "acked": acked}
 
 
 def _rng(r):
@@ -202,6 +279,9 @@ def describe(s):
         lines.append(f"  cards: not countable - {s['count_note']}")
     for i in s["issues"]:
         lines.append(f"  ! {i}")
+    for a in s.get("acked", []):
+        # Shown, but not an issue: someone confirmed this card is deliberate.
+        lines.append(f"  · acknowledged: {a}")
     if not s["issues"] and any(p["populated"] for p in s["ports"]):
         lines.append("  all cards consistent with their parameter group")
     return "\n".join(lines)
@@ -215,6 +295,12 @@ def main():
     ap.add_argument("--ports", type=int, default=4)
     ap.add_argument("--max-idx", type=int, default=127)
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--ack", default=None,
+                    help="cards known to be deliberate, as PORT:IDX "
+                         "(1-based port, as shown in the warning), "
+                         "comma-separated e.g. --ack 1:0")
+    ap.add_argument("--warmup", type=int, default=1,
+                    help="throwaway reads before surveying; the first\n                          transaction of a session is unreliable")
     ap.add_argument("--walk", action="store_true",
                     help="print every index the survey reads, with its geometry, "
                          "block digest and whether it equals the clamp value - "
@@ -228,17 +314,23 @@ def main():
         ser, baud = detect_baud(args.port)
         if ser is None:
             sys.exit(f"nothing answered on {args.port}")
-    def trace(port, idx, geo, dig, is_clamp):
+    def trace(port, idx, geo, dig, is_clamp, data):
         if geo:
+            # hint = offset 22 (~height/20) and the driver params: the fields the
+            # consistency check groups on, shown raw so an odd card is visible.
+            prm = " ".join(f"{data[o]:3d}" for o in PARAM_OFFSETS)
             print(f"  port {port+1} idx {idx:3d}: {geo[0]:4d}x{geo[1]:<4d} "
-                  f"{dig}{'  == clamp' if is_clamp else ''}")
+                  f"{dig}  hint={data[HEIGHT_HINT_OFF]:3d}  params[{prm}]"
+                  f"{'  == clamp' if is_clamp else ''}")
         else:
             print(f"  port {port+1} idx {idx:3d}: no geometry (end of chain)")
 
     if args.walk:
         print(f"== {args.port} @ {baud}  raw walk ==")
     try:
-        s = survey(ser, args.ports, args.max_idx, on_read=trace if args.walk else None)
+        s = survey(ser, args.ports, args.max_idx,
+                   on_read=trace if args.walk else None,
+                   warmup=args.warmup, ack=parse_ack(args.ack))
     finally:
         ser.close()
     if args.walk:

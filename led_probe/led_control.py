@@ -310,6 +310,12 @@ class NovaLink:
             from led_brightness import find_card
             if self.card is None:
                 self.card = find_card(self.ser, self.seq)   # cards may be on port 1/2
+                if self.card is None:
+                    # No port answered with valid geometry. find_card no longer
+                    # falls back to an echoing port, so there is nothing here that
+                    # can be trusted as brightness - report unknown and keep the
+                    # link open for the next tick.
+                    return (None, None)
             p, i = self.card
             raw = _rb(self.ser, p, i, self.seq)
             if raw is None:

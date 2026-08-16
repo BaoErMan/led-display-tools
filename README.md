@@ -7,7 +7,8 @@ drive the wall directly over its USB/serial link, or work offline on captures.
 Assembled 2026-08-15 from `fleet-monitor-brightness-v4.0.2/client` (which carried
 the newest copy of nearly everything), plus tools that survived only in the older
 research bundles: `nova_probe_re/`, `hdy1-autobright-research.zip`,
-`led_ambient_gui.zip`.
+`led_ambient_gui.zip`. `nova_cards.py` refreshed 2026-08-16 from **v4.0.5**; no
+other tool here changed in 4.0.3–4.0.5.
 
 ---
 
@@ -120,11 +121,27 @@ both probes; runnable on its own to classify a captured frame.
 
 ### `led_brightness.py` — NovaStar brightness read (library-style)
 Read-only, NovaStar-only, never raises — returns
-`{"serial_port", "vendor", "raw", "pct"}` or `{"error": …}`. Reads once at
-(port 0, index 0) because NovaStar brightness is global. Sends no Huidu frames, so
-it's safe to run blind on a machine that might be Huidu.
+`{"serial_port", "vendor", "port", "idx", "raw", "pct"}` or `{"error": …}`. This
+is what the fleet client reports to the dashboard, so run it when the dashboard's
+number is in doubt: it prints **which card it read**, which `nova_bright.py` does
+not. Brightness is global on NovaStar, so one real card gives the wall's value —
+`find_card()` takes the first port answering with valid geometry, since the chain
+may hang off any output port. Sends no Huidu frames, so it's safe to run blind on
+a machine that might be Huidu.
 
     python led_probe/led_brightness.py --led-port COM5
+    # COM5: 60% (raw 153/255, novastar, port1 idx0)
+
+**Valid geometry does not mean "a card."** An MCTRL300 answers every index of an
+*unused* port with a well-formed 240x100 block, and two live walls reported 11%
+(raw 28) from exactly that filler while their real cards sat at 60%. Since 4.0.7
+`find_card()` reads each port's answer at index 177 and takes the first index
+whose block **differs** from it, walking 16 indices deep — on those walls the
+cards were at port 2 idx 6–9, which a 2-deep scan never reached. A card that
+can't be distinguished from the filler is still used as a last resort (an
+MCTRL600's clamp *is* its last real card's block) but is flagged `verified:
+False`. Nothing anywhere → an error, so the dashboard omits the value rather
+than showing a wrong one.
 
 ### `led_control.py` — persistent NovaStar link
 Opens one CP210x connection, detects baud once, and exposes
@@ -173,14 +190,38 @@ the sensor and confirm which way it moves.
 
 ### `nova_cards.py` — receiving-card survey, with a misconfiguration check
 Walks every port collecting distinct card config blocks, groups them by driver
-parameters, and flags any block that shares a parameter set but not a geometry —
-which is exactly how a 240×80 panel still carrying a 240×100 height was caught on a
-real wall. Honest about counting: an MCTRL600 answers out-of-range indices by
-repeating the last card, so an exact count isn't derivable there and `count` comes
-back `None` with a `count_note` saying why.
+parameters, and flags two kinds of fault:
+
+- a block that shares a parameter set but **not** a geometry — how a 240×80 panel
+  still carrying a 240×100 height was caught on a real wall;
+- the **odd one out**: a single card whose parameters match nothing else on the
+  wall. It sits alone in its own group, so the first check never compares it —
+  a 240×20 block with `params[2 8 0 32]` sat unflagged between 240×100s and
+  240×80s while the survey reported "all cards consistent".
+
+`--ack PORT:IDX` marks a card as deliberate (1-based port, 0-based index — written
+the way the warning prints it). It stays in the geometry and is listed as
+`acknowledged`, but stops being an issue and drops the "check this in NovaLCT"
+advice. Anything new still warns, including a different fault on the same port.
+A live wall needs this for a 240×20 strip added to compensate for shipping damage.
+
+Honest about counting: an MCTRL600 answers out-of-range indices by repeating the
+last card, so an exact count isn't derivable there and `count` comes back `None`
+with a `count_note` saying why.
 
     python led_probe/nova_probe_re/nova_cards.py --port COM5 --ports 4
     python led_probe/nova_probe_re/nova_cards.py --port COM5 --ports 4 --json
+    python led_probe/nova_probe_re/nova_cards.py --port COM5 --ack 1:0     # known-deliberate card
+    python led_probe/nova_probe_re/nova_cards.py --port COM5 --walk        # every index, with params
+
+Two behaviours worth knowing when reading a `--walk`: the survey discards one
+throwaway read first (`--warmup`, default 1) because the first transaction of a
+session is unreliable — that 240×20 artifact came from the very first read — and
+the walk stops after a run of identical blocks, not identical-and-equal-to-clamp,
+which cut a port from 128+ reads to 51 for the same output. Also, the config
+blocks carry a volatile field: **digests differ between sessions for the same
+card**, so never compare them across runs. Every comparison the survey makes is
+within one session.
 
 ### `nova_chain.py` — what a port really returns per index
 The diagnostic behind that caveat: does the sending card clamp or wrap past the end

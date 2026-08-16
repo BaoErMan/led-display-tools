@@ -8,9 +8,10 @@ Design goals (see the discussion that led to this build):
     gets no valid reply and soft-fails to an error dict. Huidu gear is never
     disturbed.
   * Read-only. It never writes brightness/gains; it only reads the R/W register.
-  * Broadcast-authoritative. Brightness is global on NovaStar, so a single read
-    at (port 0, index 0) is the real value - no per-card scan, minimal serial
-    traffic, no phantom-card noise.
+  * Broadcast-authoritative. Brightness is global on NovaStar, so ONE real card
+    gives the wall's value - no per-card scan, minimal serial traffic. "Real" is
+    the load-bearing word: the card must answer with valid geometry (find_card),
+    because an empty port echoes bytes that read as a plausible brightness.
   * Never raises. A busy port (operator running NovaLCT/MonitorSite), an absent
     port, or a missing dependency all return {"error": "..."}.
 
@@ -68,28 +69,119 @@ def _open(port, baud):
     return serial.Serial(dev, baud, timeout=0.1, write_timeout=2.0)
 
 
-def find_card(ser, seq, ports=8, idxs=2):
-    """Return (port, idx) of a REAL receiving card. Cards are NOT always on
-    port 0 / idx 0 - the chain can hang off any output port (2-, 4-, 8-port
-    sending cards exist), and an empty port echoes non-zero bytes with NO
-    geometry and brightness 0. So scan the ports and prefer the first card whose
-    config block yields valid geometry; fall back to the first port/idx reporting
-    non-zero brightness; else (0, 0). Returns on the first hit, so a low-port card
-    is cheap; only a fully empty/off wall scans everything."""
-    from nova_probe import build_read, transact, RX_BLOCK, parse_geometry
-    from nova_bright import BRIGHT_REG
-    fallback = None
+CLAMP_IDX = 177         # far past any real chain; what a port returns here is
+                        # its "nothing at this index" answer (see nova_cards.py)
+FIND_DEPTH = 16         # indices to walk per port looking for a real card
+FIND_GAP = 3            # consecutive unparseable blocks that end a port
+
+
+def _block(ser, port, idx, seq):
+    from nova_probe import build_read, transact, RX_BLOCK
+    reps = transact(ser, build_read(seq.next(), 0x01, port, idx, RX_BLOCK, 256))
+    return reps[0]["data"] if reps else b""
+
+
+def _clamp_digest(ser, port, seq):
+    """Digest of what this port answers PAST the end of its chain, or None.
+
+    A port with no cards does not go silent on every controller: an MCTRL300
+    answers every index with a well-formed 240x100 block carrying valid geometry.
+    Reading that index tells us what "no card here" looks like on this port, so
+    the walk below can tell a real card from the filler."""
+    import hashlib
+    from nova_probe import parse_geometry
+    data = _block(ser, port, CLAMP_IDX, seq)
+    return hashlib.sha1(data).hexdigest()[:8] if parse_geometry(data) else None
+
+
+def find_card_ex(ser, seq, ports=8, idxs=FIND_DEPTH, gap=FIND_GAP):
+    """((port, idx), strong) of a REAL receiving card, or (None, False).
+
+    `strong` is True when the block DIFFERS from what its port answers past the
+    end of the chain - i.e. it cannot be filler. False means it parsed but equals
+    that answer, which is normal on an MCTRL600 (whose clamp is the last real
+    card's block) and is why such a card is still usable. The caller keeps the
+    flag so a later re-check applies the same standard the choice was made by,
+    instead of rejecting a card it just accepted.
+
+    Cards are NOT always on port 0 / idx 0 - the chain can hang off any output
+    port, and it need not start at index 0: on a live wall port 1 was empty and
+    port 2 held four 240x80 cards at indices 6-9.
+
+    Valid geometry is NOT sufficient to call something a card. Two failure modes
+    have both been seen on live hardware:
+
+      * an empty port echoes non-zero bytes with NO geometry (the old code's
+        "first non-zero brightness byte" fallback settled on these);
+      * an empty port answers EVERY index with a well-formed block that parses
+        perfectly - an MCTRL300 returns 240x100 with params[10 16 255 255] at
+        every index of an unused port, and at index 177 of a used one.
+
+    The second is why geometry alone was not enough: two walls reported 11%
+    (raw 28) on the dashboard, read from that filler block at port 0 index 0,
+    while their real cards on port 2 were at 60%. Brightness is written as a
+    BROADCAST and is global, so any REAL card gives the wall's value - but the
+    filler is not a card and its byte is not brightness.
+
+    So: learn each port's out-of-range answer first, then take the first index
+    whose block parses AND differs from it. A block equal to the clamp is kept
+    only as a last resort, because on an MCTRL600 the clamp IS the last real
+    card's block - on a wall of identical panels every real card matches it, and
+    refusing them would report nothing on a perfectly healthy wall.
+
+    Returns None if nothing parses anywhere; the caller turns that into an error
+    the dashboard omits, which beats a confident wrong number.
+    """
+    import hashlib
+    from nova_probe import parse_geometry
+    weak = None
     for p in range(ports):
+        clamp = _clamp_digest(ser, p, seq)
+        misses = 0
         for i in range(idxs):
-            reps = transact(ser, build_read(seq.next(), 0x01, p, i, RX_BLOCK, 256))
-            data = reps[0]["data"] if reps else b""
-            if parse_geometry(data):
-                return (p, i)
-            if fallback is None:
-                br = transact(ser, build_read(seq.next(), 0x01, p, i, BRIGHT_REG, 1))
-                if br and br[0]["data"] and br[0]["data"][0] > 0:
-                    fallback = (p, i)
-    return fallback or (0, 0)
+            data = _block(ser, p, i, seq)
+            if not parse_geometry(data):
+                misses += 1
+                if misses >= gap:
+                    break                  # silent/garbage port, move on
+                continue
+            misses = 0
+            if clamp is None or hashlib.sha1(data).hexdigest()[:8] != clamp:
+                return (p, i), True        # differs from the filler: a real card
+            if weak is None:
+                weak = (p, i)              # equals the filler; only if nothing better
+    return weak, False
+
+
+def find_card(ser, seq, ports=8, idxs=FIND_DEPTH, gap=FIND_GAP):
+    """(port, idx) of a real receiving card, or None. See find_card_ex."""
+    return find_card_ex(ser, seq, ports, idxs, gap)[0]
+
+
+def card_still_real(ser, card, seq, strong=True):
+    """Does the cached (port, idx) still look like the card we chose?
+
+    The cache was previously trusted until a read returned NOTHING, so a wrong
+    pick survived every read that came back with any byte at all - i.e. for the
+    client's whole lifetime, clearable only by a restart. Two 256-byte reads per
+    interval are cheap next to reporting a wrong brightness for days.
+
+    It must still parse. `strong` cards must also still differ from what the port
+    answers past the end of its chain - one that now matches the filler has gone
+    away (or was never real), so the caller re-scans. A card chosen WITHOUT that
+    property is only re-checked for geometry, since demanding it now would reject
+    the card every time on a wall where nothing can satisfy it."""
+    import hashlib
+    from nova_probe import parse_geometry
+    data = _block(ser, card[0], card[1], seq)
+    if not parse_geometry(data):
+        return False
+    if not strong:
+        return True
+    clamp = _clamp_digest(ser, card[0], seq)
+    if clamp is None:
+        return True                        # port gives no filler answer to compare
+    return hashlib.sha1(data).hexdigest()[:8] != clamp
 
 
 def read_brightness(port=None, baud=None):
@@ -128,16 +220,31 @@ def read_brightness(port=None, baud=None):
                 if not transact(ser, build_read(seq.next(), 0x00, 0, 0, TX_ID, 8)):
                     last_err = f"{p}@{b}: no NovaStar reply"
                     continue
-                cp, ci = _good_card.get(p) or find_card(ser, seq)  # cached, else scan
+                card = _good_card.get(p)          # (port, idx, strong)
+                if card is not None and not card_still_real(ser, card[:2], seq,
+                                                            card[2]):
+                    _good_card.pop(p, None)       # cached card is no longer real
+                    card = None
+                if card is None:
+                    found, strong = find_card_ex(ser, seq)
+                    card = (found[0], found[1], strong) if found else None
+                if card is None:
+                    # NovaStar answered its ID read, but nothing on any port looks
+                    # like a receiving card at this rate. Do not guess a value from
+                    # an echoing port; try the next rate, then report the error.
+                    last_err = (f"{p}@{b}: NovaStar replied but no receiving card "
+                                f"returned valid geometry")
+                    continue
+                cp, ci = card[0], card[1]
                 raw = _read_one(ser, cp, ci, seq)
                 if raw is None:
                     _good_card.pop(p, None)       # stale mapping; re-find next time
                     last_err = f"{p}@{b}: NovaStar found but brightness read returned nothing"
                     continue
                 _good_baud[p] = b                 # remember for next time
-                _good_card[p] = (cp, ci)
+                _good_card[p] = card
                 return {"serial_port": p, "baud": b, "vendor": "novastar",
-                        "port": cp, "idx": ci,
+                        "port": cp, "idx": ci, "verified": bool(card[2]),
                         "raw": int(raw), "pct": int(raw_to_pct(raw))}
             except Exception as e:
                 last_err = f"{p}@{b}: {e}"
@@ -159,7 +266,10 @@ if __name__ == "__main__":
     res = read_brightness(port=args.led_port, baud=args.baud)
     if res.get("raw") is not None:
         print(f"{res['serial_port']}: {res['pct']}% (raw {res['raw']}/255, {res['vendor']}, "
-              f"port{res.get('port')} idx{res.get('idx')})")
+              f"port{(res.get('port') or 0) + 1} idx{res.get('idx')}"
+              + ("" if res.get("verified") else ", card NOT distinguishable from "
+                                                "this port's out-of-range answer")
+              + ")")
         raise SystemExit(0)
     print(res.get("error", "unknown error"))
     raise SystemExit(1)
