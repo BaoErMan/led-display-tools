@@ -1,0 +1,8 @@
+The raw NovaStar USB captures are too large to duplicate here (44 MB + 77 MB):
+
+  probe.pcap             /home/lox/claude/nova_probe_re/probe.pcap
+  readback.pcap          /home/lox/claude/led_probe/nova_probe_re/readback.pcap
+
+The decoded transcript (all_data.tsv, produced by extract.py) is already in
+led_probe/nova_probe_re/, so analyze.py and bright_analyze.py run as-is.
+To re-decode a raw capture:  python led_probe/nova_probe_re/extract.py <file.pcap>

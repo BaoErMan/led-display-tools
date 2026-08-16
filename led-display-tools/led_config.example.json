@@ -1,0 +1,99 @@
+{
+  "_help": "curve: [[lux,pct],...] piecewise-linear, clamped at the ends. sensor_fail_pct: brightness used when the light sensor is unavailable. time_caps: [{from,to,max_pct}] hard ceiling by time of day (UTC, HH:MM, wraps midnight; applies in manual AND ambient) - NONE by default; see led_config.example.json for the format. This file hot-reloads within ~5s of a save.",
+  "curve": [
+    [
+      20,
+      20
+    ],
+    [
+      651,
+      23
+    ],
+    [
+      1281,
+      26
+    ],
+    [
+      1912,
+      29
+    ],
+    [
+      2542,
+      33
+    ],
+    [
+      3173,
+      36
+    ],
+    [
+      3803,
+      39
+    ],
+    [
+      4434,
+      42
+    ],
+    [
+      5064,
+      45
+    ],
+    [
+      5695,
+      48
+    ],
+    [
+      6325,
+      52
+    ],
+    [
+      6956,
+      55
+    ],
+    [
+      7586,
+      58
+    ],
+    [
+      8217,
+      61
+    ],
+    [
+      8847,
+      64
+    ],
+    [
+      9478,
+      67
+    ],
+    [
+      10108,
+      71
+    ],
+    [
+      10739,
+      74
+    ],
+    [
+      11369,
+      77
+    ],
+    [
+      12000,
+      80
+    ]
+  ],
+  "sensor_fail_pct": 30,
+  "time_caps": [
+    {
+      "from": "19:00",
+      "to": "07:00",
+      "max_pct": 30
+    }
+  ],
+  "_help_amb": "amb_min/amb_max: ambient brightness RANGE for Huidu walls. HD-Y1 clamps its on-card loop to it; a standalone 0-254 sensor maps light linearly across it. NovaStar ambient uses the curve above instead.",
+  "amb_min": 20,
+  "amb_max": 90,
+  "light_lo": 30,
+  "light_hi": 250,
+  "_light_help": "Standalone Huidu light sensor only (0-254, higher = brighter; NOT lux). light_lo/light_hi are THIS wall's settled dark and bright readings - amb_min applies at/below light_lo, amb_max at/above light_hi. Measure with hd_sensor.py --log day.csv then --summarize day.csv. The 0/254 defaults are almost never right: a measured outdoor wall ran ~30 at night and ~252 in daylight, where 0/254 would strand it at ~28% overnight."
+}
