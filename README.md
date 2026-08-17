@@ -10,7 +10,8 @@ research bundles: `nova_probe_re/`, `hdy1-autobright-research.zip`,
 `led_ambient_gui.zip`. `nova_cards.py` refreshed 2026-08-16 from **v4.0.5**; no
 other tool here changed in 4.0.3–4.0.5.
 
----
+
+---[:heart: Sponsor this project](https://github.com/sponsors/BaoErMan) -- Please support my project
 
 ## Contents
 
