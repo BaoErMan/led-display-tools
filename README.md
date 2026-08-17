@@ -199,11 +199,20 @@ parameters, and flags two kinds of fault:
   a 240×20 block with `params[2 8 0 32]` sat unflagged between 240×100s and
   240×80s while the survey reported "all cards consistent".
 
-`--ack PORT:IDX` marks a card as deliberate (1-based port, 0-based index — written
+A genuine odd-one-out is often deliberate — a real MCTRL600 wall carries a 240x20
+strip added to compensate for shipping damage, flagged every survey. `--ack
+PORT:IDX` marks a card as deliberate (1-based port, 0-based index — written
 the way the warning prints it). It stays in the geometry and is listed as
 `acknowledged`, but stops being an issue and drops the "check this in NovaLCT"
 advice. Anything new still warns, including a different fault on the same port.
 A live wall needs this for a 240×20 strip added to compensate for shipping damage.
+
+Since 4.0.8 it also tells an **empty port** from a populated one. An MCTRL300
+answers every index of an unused port with a well-formed 240x100 block, which the
+survey used to list as `240x100 idx 0+` and call consistent — describing a port
+with nothing plugged in. A block is treated as filler only where the wall proves
+it (the value appearing *before* a run that differs from it), so an MCTRL600 —
+whose clamp is its last real card's block, and only ever trails — is unaffected.
 
 Honest about counting: an MCTRL600 answers out-of-range indices by repeating the
 last card, so an exact count isn't derivable there and `count` comes back `None`
@@ -229,6 +238,24 @@ of the chain? Read-only, config reads only.
 
     python led_probe/nova_probe_re/nova_chain.py --port COM5 --ports 2
     python led_probe/nova_probe_re/nova_chain.py --port COM5 --indices 0,1,2,4,16,177,250
+
+**There is no single "out-of-range answer" for a port** — it depends how far past
+the end you ask, so probe several distances. On a live MCTRL600 whose port 1 held
+nine cards at idx 0-8, indices 9-22 returned its **last** card and index 177
+returned its **first**; port 2 of the same controller returned its last card at
+both distances. A mismatch between a far probe and a port's trailing run is
+hardware behaviour, not a fault — treating it as one is how a real 240x20 card
+once got deleted from a survey.
+
+### `nova_model.py` — capture what the controller *is*
+Records the sending card's identity together with how that controller answers past
+the end of a chain — the two facts that decide how a port must be read. A
+diagnostic: `nova_cards.py` deliberately works from block content alone and never
+consults it.
+
+    python led_probe/nova_probe_re/nova_model.py --port COM5
+    python led_probe/nova_probe_re/nova_model.py --port COM5 --ports 2 --json
+    python led_probe/nova_probe_re/nova_model.py --port COM5 --save com5_model.json
 
 ### `serial_caps.py` — can this adapter actually do 1048576 baud?
 MCTRL600s run at 2²⁰ bps, which isn't a standard termios rate. A Linux driver may

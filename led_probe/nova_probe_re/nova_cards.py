@@ -40,10 +40,32 @@ from nova_probe import (Seq, build_read, transact, RX_BLOCK,   # noqa: E402
 # good and bad cards into different groups and the mismatch was never compared -
 # the check silently passed on the very wall that had the fault. Group by what the
 # panel's driver needs, then verify the geometry agrees.
-PARAM_OFFSETS = (27, 34, 93, 94)
+#
+# 93 and 94 are EXCLUDED for the same reason, established on a mirrored wall
+# (COM10): its ten cards run up through 1-5 and back down through 6-10, the second
+# five repeating the first five's image at the same desktop origin. Every card in
+# the first chain carries 93,94 = 247,1 and every card in the second carries 0,16,
+# ACROSS panel types:
+#     idx 0-3  200x100  27,34 = 10,16   93,94 = 247,1     cards 1-4
+#     idx 4    200x80   27,34 =  8,8    93,94 = 247,1     card 5
+#     idx 5    200x80   27,34 =  8,8    93,94 =   0,16    card 6
+#     idx 6-9  200x100  27,34 = 10,16   93,94 =   0,16    cards 7-10
+# So they identify the CHAIN, not the hardware. Including them put cards 5 and 6 -
+# the same 200x80 panel - in separate groups of one, and the odd-one-out check
+# reported both as "match no other card on this wall". Two false alarms on a
+# correctly configured wall, and every mirrored or multi-section wall would do the
+# same. 27 and 34 alone track panel type and still catch the original fault: a
+# 240x80 carrying a 240x100 height groups with the real 240x80s and its geometry
+# disagrees with theirs.
+PARAM_OFFSETS = (27, 34)
 HEIGHT_HINT_OFF = 22          # ~height/20; cross-checked separately
 GEO_OFFSETS = (23, 24, 25, 26)
 CLAMP_PROBE = 50         # how far past max_idx to look for the clamp value
+# Extra out-of-range indices to ask when the first reply does not parse. All are
+# past any real chain, and a controller that answers past the end gives the same
+# block at each (verified with nova_chain.py: indices 20, 40, 100 and 177 all
+# returned one block). One flaky reply must not cost the whole port its clamp.
+CLAMP_PROBE_OFFSETS = (CLAMP_PROBE, CLAMP_PROBE + 23, CLAMP_PROBE + 73)
 
 # How many CONSECUTIVE clamp-valued blocks to accept before calling it the echo
 # and stopping. This must exceed the longest run of identical cards a real wall
@@ -52,6 +74,13 @@ CLAMP_PROBE = 50         # how far past max_idx to look for the clamp value
 # card matches the clamp had that card reported as the end of the chain, hiding
 # every card behind it. Overshooting only costs reads and an open-ended tail.
 CLAMP_RUN = 16
+
+# The same stop for when the clamp value could not be read at all. Higher, because
+# without it we cannot tell a long uniform chain from padding and a wall may
+# genuinely carry a run this long; but bounded, because the alternative - reading
+# every index to max_idx - took a live COM10 walk past index 91 before it was
+# interrupted, and looked like a hang.
+CLAMP_RUN_BLIND = 32
 
 
 def _digest(b):
@@ -63,8 +92,30 @@ def _block(ser, port, idx, seq):
     return reps[0]["data"] if reps else b""
 
 
+def _clamp_probe(ser, port, max_idx, seq, offsets=CLAMP_PROBE_OFFSETS):
+    """Digest of what this port answers past the end of its chain, or None.
+
+    Asks at more than one out-of-range index because ONE read decides a great
+    deal: without this value the walk cannot stop early, cannot drop a trailing
+    echo, and cannot recognise filler. On COM10 the read at max_idx+50 parsed in
+    one session and not in the next, and nova_chain.py read the same index fine
+    moments later - a transient bad reply, not a property of the port.
+
+    A port that returns NOTHING is silent, not flaky, so it is not retried: that
+    keeps an unused port as cheap as it was (one read, not three)."""
+    for off in offsets:
+        data = _block(ser, port, max_idx + off, seq)
+        if parse_geometry(data):
+            return _digest(data)
+        if not data:
+            return None                  # silent port; retrying only wastes time
+    return None
+
+
 def survey_port(ser, port, seq, max_idx=127, on_read=None):
-    """[{first, last, geometry, params, digest}] of distinct blocks on one port,
+    """(runs, clamped, clamp_digest) for one output port.
+
+    [{first, last, geometry, params, digest}] of distinct blocks on one port,
     plus whether the walk ran into the controller's clamp value.
 
     The clamp block is identified FIRST, by reading an index far past any real
@@ -88,10 +139,9 @@ def survey_port(ser, port, seq, max_idx=127, on_read=None):
     a chain gives an exact count, and must keep walking through any number of
     identical cards to get it.
     """
-    clamp = _block(ser, port, max_idx + CLAMP_PROBE, seq)
-    clamp_dig = _digest(clamp) if parse_geometry(clamp) else None
+    clamp_dig = _clamp_probe(ser, port, max_idx, seq)
 
-    runs, prev, repeat = [], None, 0
+    runs, prev, repeat, reprobed = [], None, 0, False
     idx = 0
     while idx <= max_idx:
         data = _block(ser, port, idx, seq)
@@ -101,7 +151,7 @@ def survey_port(ser, port, seq, max_idx=127, on_read=None):
             on_read(port, idx, geo, dig, dig is not None and dig == clamp_dig,
                     data)
         if not geo:
-            return runs, False                      # unused port / real end of chain
+            return runs, False, clamp_dig            # unused port / real end of chain
         if dig == prev:
             runs[-1]["last"] = idx
             repeat += 1
@@ -111,14 +161,30 @@ def survey_port(ser, port, seq, max_idx=127, on_read=None):
                          "params": [data[o] for o in PARAM_OFFSETS]})
             prev = dig
             repeat = 1
-        if clamp_dig and repeat >= CLAMP_RUN:
-            runs[-1]["open_ended"] = True
-            return _drop_echo(runs, clamp_dig), True
+        if repeat >= CLAMP_RUN:
+            if clamp_dig is None and not reprobed:
+                # The probe at the top can fail transiently - observed on COM10,
+                # where one session read index 177 fine and the next did not, and
+                # nova_chain.py read it fine moments later. Losing it disabled this
+                # stop entirely and the walk ground through all 128 indices, which
+                # reads as a hang. Ask again now, once.
+                reprobed = True
+                clamp_dig = _clamp_probe(ser, port, max_idx, seq)
+            if clamp_dig:
+                runs[-1]["open_ended"] = True
+                return _drop_echo(runs, clamp_dig), True, clamp_dig
+            if repeat >= CLAMP_RUN_BLIND:
+                # Still no clamp value. CLAMP_RUN_BLIND identical blocks in a row
+                # means the tail is unknowable whether or not we know the clamp -
+                # 32 real identical cards and 16 cards plus padding look the same
+                # from here - so stop and say so rather than read to max_idx.
+                runs[-1]["open_ended"] = True
+                return runs, True, None
         idx += 1
     # Ran the whole range without an end: the controller answers everything.
     if runs:
         runs[-1]["open_ended"] = True
-    return _drop_echo(runs, clamp_dig), True
+    return _drop_echo(runs, clamp_dig), True, clamp_dig
 
 
 def _drop_echo(runs, clamp_dig):
@@ -135,6 +201,77 @@ def _drop_echo(runs, clamp_dig):
         runs = runs[:-1]
         runs[-1]["open_ended"] = True
     return runs
+
+
+def proven_fillers(out):
+    """Digests that are this controller's "no card here" value, not hardware.
+
+    Wrong twice before, both times on a real wall, so the reasoning is spelled
+    out. An out-of-range index is answered differently by different controllers:
+
+      MCTRL300  on an UNUSED port, a SYNTHETIC block - a well-formed
+                200x100/240x100 that matches no real card - at every index.
+                On a USED port it answers with that port's LAST CARD, exactly as
+                an MCTRL600 does: on COM10 port 2, index 177 returns the block
+                the real cards at idx 6-9 return. The behaviour is per PORT, not
+                per controller model, which is why nothing here consults one.
+      MCTRL600  A REAL CARD's block - but not always the SAME one. Which card
+                depends on how far past the end you ask (nova_model.py). On COM5
+                port 1, indices just past the chain return its LAST card while
+                index 177 returns its FIRST; port 2 of the same controller returns
+                its last card at both distances.
+
+                Two consequences, both benign and both seen on COM5:
+                  * the probe value can differ from the port's trailing run, so
+                    _drop_echo does not fire and the tail stays open-ended. That
+                    is honest - the tail length is not knowable either way.
+                  * where the far probe lands on the FIRST card, index 0 is
+                    marked "== clamp" in a --walk. On COM5 that is the deliberate
+                    240x20 strip, a real card. It survives because a run of ONE
+                    index ahead of a real card is not filler; see (a) below.
+
+    A consequence worth stating: where a port's last cards and its out-of-range
+    answer are the same block, the tail length is NOT derivable - COM10 port 2
+    holds ten cards and reports "200x100 idx 6+", which is the honest answer, not
+    a bug to be fixed.
+
+    "The clamp value appears ahead of a real card" was therefore not proof: on
+    that MCTRL600 the first card IS the clamp value - a deliberate 240x20 strip
+    at port 1 index 0 - and the rule deleted it from the survey as filler. Two
+    narrower tests, either of which proves filler:
+
+    (a) it FILLS. A clamp-valued run of >=2 consecutive indices ahead of a real
+        card is the controller padding empty slots. A run of ONE index ahead of a
+        real card is a card - that is the 240x20 strip, and the whole reason (a)
+        counts indices instead of just looking.
+
+    (b) it is SYNTHETIC. If the clamp appears nowhere on any port that has proven
+        it holds real cards (>=2 distinct blocks), no card on this wall looks like
+        it - so a port made entirely of it is empty. This is what an MCTRL300 with
+        cards starting at index 0 needs, where (a) never gets its evidence.
+
+    Neither fires on an MCTRL600: its clamp is a real card, so it appears on a
+    multi-block port, and it never pads. Verified against three captured walls.
+    """
+    proven = set()
+    # Ports that have shown >=2 distinct blocks are holding real cards, whatever
+    # the clamp turns out to mean; they are the reference for test (b).
+    multi = [p for p in out if len({r["digest"] for r in p["runs"]}) >= 2]
+    for p in out:
+        clamp_dig = p.get("clamp")
+        if not clamp_dig:
+            continue
+        runs = p["runs"]
+        first_real = next((n for n, r in enumerate(runs)
+                           if r["digest"] != clamp_dig), None)
+        if first_real is not None:
+            if any(r["digest"] == clamp_dig and r["last"] > r["first"]
+                   for r in runs[:first_real]):
+                proven.add(clamp_dig)                                    # (a)
+        elif multi and not any(r["digest"] == clamp_dig
+                               for m in multi for r in m["runs"]):
+            proven.add(clamp_dig)                                        # (b)
+    return proven
 
 
 def parse_ack(spec):
@@ -236,10 +373,26 @@ def survey(ser, ports=4, max_idx=127, seq=None, on_read=None, warmup=1, ack=()):
         _block(ser, 0, 0, seq)
     out, any_clamped = [], False
     for p in range(ports):
-        runs, clamped = survey_port(ser, p, seq, max_idx, on_read)
+        runs, clamped, clamp_dig = survey_port(ser, p, seq, max_idx, on_read)
         any_clamped |= clamped
         out.append({"port": p, "populated": bool(runs), "runs": runs,
-                    "clamped": clamped})
+                    "clamped": clamped, "clamp": clamp_dig})
+
+    # Blocks PROVEN to be "no card at this index" rather than hardware. Proof is
+    # per digest and comes from any port that showed the value in front of a real
+    # card (see proven_fillers); once proven, the same value is filler wherever it
+    # appears - the walls that exposed this answer the identical block on every
+    # port. A port left with nothing is then empty, not populated: previously an
+    # unused port reported its filler as "240x100 idx 0+" and the survey called
+    # the wall consistent, while brightness was being read from that non-card.
+    proven = proven_fillers(out)
+    if proven:
+        for p in out:
+            kept = [r for r in p["runs"] if r["digest"] not in proven]
+            if len(kept) != len(p["runs"]):
+                p["filler_dropped"] = len(p["runs"]) - len(kept)
+                p["runs"] = kept
+                p["populated"] = bool(kept)
     live = [p for p in out if p["populated"]]
     count, note = None, ""
     if not live:
@@ -267,7 +420,13 @@ def describe(s):
     lines = []
     for p in s["ports"]:
         if not p["populated"]:
-            lines.append(f"  port {p['port']+1}: unused")
+            # "empty" and "unused" are different findings: the first is a port
+            # that ANSWERED at every index with this controller's no-card block,
+            # the second returned nothing at all. Both mean no cards.
+            lines.append(f"  port {p['port']+1}: "
+                         + ("empty (every index returns the controller's "
+                            "no-card block)" if p.get("filler_dropped")
+                            else "unused"))
             continue
         segs = ", ".join(f"{r['geometry'][0]}x{r['geometry'][1]} {_rng(r)}"
                          for r in p["runs"])
